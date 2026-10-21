@@ -6,6 +6,7 @@ __pycache__/
 .admin-token
 .demo-token
 .demo/
+.demo-run.lock
 results/
 runs/
 test-results/
