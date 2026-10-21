@@ -17,7 +17,7 @@ from pathlib import Path
 root=Path(__file__).resolve().parent
 def event(name):
     with (root/'events.jsonl').open('a') as f:
-        f.write(json.dumps({'event':name,'time':time.monotonic()})+'\\n')
+        f.write(json.dumps({'event':name,'time':time.monotonic(),'session':os.environ.get('BENCH_DEMO_SESSION')})+'\\n')
 args=sys.argv[1:]
 if args[0]=='serve':
     sockets=[]
@@ -37,7 +37,7 @@ else:event(args[0])
 
 
 class DemoCommandTest(unittest.TestCase):
-    def execute_demo(self, parallel, budget_stop=False):
+    def execute_demo(self, parallel, budget_stop=False, fresh_sessions=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'bench.py').write_text(STUB)
@@ -46,19 +46,27 @@ class DemoCommandTest(unittest.TestCase):
             (root / 'tools/node_modules/@playwright/test').mkdir(parents=True)
             (root / 'webgames/dist').mkdir(parents=True)
             (root / 'webgames/dist/index.html').touch()
+            bindir = root / 'bin'
+            bindir.mkdir()
+            cli = bindir / 'playwright-cli'
+            cli.write_text('#!' + sys.executable + '\nimport sys\nprint("browser command accepted")\n')
+            cli.chmod(0o755)
             held = [socket.socket(), socket.socket()]
             for s in held:
                 s.bind(('127.0.0.1', 0))
             ports = [s.getsockname()[1] for s in held]
             for s in held:
                 s.close()
-            env = {'DEMO_TEST_PORT1': str(ports[0]), 'DEMO_TEST_PORT2': str(ports[1])}
+            env = {'DEMO_TEST_PORT1': str(ports[0]), 'DEMO_TEST_PORT2': str(ports[1]),
+                   'PATH': str(bindir) + os.pathsep + os.environ.get('PATH', '')}
             if budget_stop:
                 env['DEMO_TEST_BUDGET_STOP'] = '1'
             with patch.object(bench, 'ROOT', root), patch.object(bench, 'RESULTS', root / 'results'), \
+                 patch.object(bench, 'WORK', root / 'work'), \
                  patch.object(bench, 'FIX_PORT', ports[0]), patch.object(bench, 'WG_PORT', ports[1]), \
                  patch.object(bench.shutil, 'which', return_value=sys.executable), patch.dict(os.environ, env):
-                code = bench.cmd_demo(argparse.Namespace(parallel=parallel, budget_usd=15.0))
+                code = bench.cmd_demo(argparse.Namespace(parallel=parallel, budget_usd=15.0,
+                                                         fresh_sessions=fresh_sessions))
             pid = int((root / 'server.pid').read_text())
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
@@ -70,6 +78,18 @@ class DemoCommandTest(unittest.TestCase):
         self.assertEqual(code, 0)
         times = {x['event']: x['time'] for x in events}
         self.assertLess(max(times['start-v1'], times['start-v2']), min(times['end-v1'], times['end-v2']))
+        starts = {x['event']: x['session'] for x in events if x['event'].startswith('start-')}
+        self.assertTrue(starts['start-v1'].startswith('v1-demo-'))
+        self.assertTrue(starts['start-v2'].startswith('v2-demo-'))
+        self.assertNotEqual(starts['start-v1'], starts['start-v2'])
+        for start in starts:
+            end = next(x for x in events if x['event'] == start.replace('start-', 'end-'))
+            self.assertEqual(end['session'], starts[start])
+
+    def test_fresh_mode_does_not_reuse_a_demo_session(self):
+        code, events = self.execute_demo(parallel=True, fresh_sessions=True)
+        self.assertEqual(code, 0)
+        self.assertTrue(all(x['session'] is None for x in events))
 
     def test_sequential_budget_stop_does_not_start_v2(self):
         code, events = self.execute_demo(parallel=False, budget_stop=True)

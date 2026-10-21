@@ -122,7 +122,13 @@ def run_env(extra=None):
 
 
 def session_env(cwd):
-    name = "bench-" + hashlib.sha256(str(Path(cwd).resolve()).encode()).hexdigest()[:12]
+    name = os.environ.get("BENCH_DEMO_SESSION")
+    if name:
+        # F2 needs separate cookie jars for its other two simultaneous accounts.
+        if Path(cwd).name in ("user-b", "user-c"):
+            name += "-" + Path(cwd).name
+    else:
+        name = "bench-" + hashlib.sha256(str(Path(cwd).resolve()).encode()).hexdigest()[:12]
     return {"PLAYWRIGHT_CLI_SESSION": name, "AGENT_BROWSER_SESSION": name,
             "PLAYWRIGHT_MCP_OUTPUT_DIR": str(Path(cwd) / ".browser-output")}
 
@@ -266,7 +272,10 @@ def tool_sessions(arm, cwd):
     return 0, ""
 
 
-def cleanup_tool(arm, cwd):
+def cleanup_tool(arm, cwd, force=False):
+    if (arm == "pwcli" and not force and os.environ.get("BENCH_DEMO_SESSION")
+            == session_env(cwd)["PLAYWRIGHT_CLI_SESSION"]):
+        return
     if arm == "pwcli":
         sh(["playwright-cli", "close"], cwd=cwd, timeout=60)
     elif arm == "agentbrowser":
@@ -461,8 +470,19 @@ def wg_by_id(tid):
 
 
 def preamble(arm, f4=False):
-    return PREAMBLE.format(tool=ARMS[arm]["tool"],
-                           f4_note=" (except the Playwright Test file this task asks you to write)" if f4 else "")
+    text = PREAMBLE.format(tool=ARMS[arm]["tool"],
+                          f4_note=" (except the Playwright Test file this task asks you to write)" if f4 else "")
+    if os.environ.get("BENCH_DEMO_SESSION"):
+        text += ("\nThis is a live presentation. Use the browser session already assigned by the "
+                 "PLAYWRIGHT_CLI_SESSION environment variable; do not override its name. It is already open "
+                 "for normal tasks: navigate with goto rather than starting a new browser. If it is closed, "
+                 "open that same named session. Leave it open on the result page when done. Do not close it, "
+                 "change its profile, or open unrelated tabs. Task-required tabs are allowed; close extra task tabs "
+                 "afterwards and leave the result tab active. Use absolute paths under your current directory "
+                 "for screenshots and state files: the browser was started from a different directory. "
+                 "A downloaded file at the exact path reported by the browser tool may be read for its task; "
+                 "do not enumerate earlier browser artifacts. The harness handles login-restart and concurrency checks.\n")
+    return text
 
 
 def fmt_rows(rows):
@@ -584,10 +604,16 @@ def execute(agents, arm, mode, timeout, include_ego):
     }
 
 
-def finish_run(arm, cwd, ex):
+def finish_run(arm, cwd, ex, force_close=False):
     sessions, sess_out = tool_sessions(arm, cwd)
-    cleanup_tool(arm, cwd)
-    kill_owned(ex["baseline"], ex["claude_pids"], arm == "ego")
+    cleanup_tool(arm, cwd, force=force_close)
+    if not os.environ.get("BENCH_DEMO_SESSION"):
+        kill_owned(ex["baseline"], ex["claude_pids"], arm == "ego")
+    elif force_close and arm == "pwcli":
+        # F1 must genuinely restart the browser before loading saved state.
+        code, out = sh(["playwright-cli", "open"], cwd=cwd)
+        if code:
+            raise RuntimeError("Could not reopen the demo session after the login restart: " + out[-300:])
     guard = ego_skill_guard()
     return {"leftover_sessions": sessions, "leftover_sessions_raw": sess_out, "ego_skill_link_removed": guard}
 
@@ -705,7 +731,7 @@ def run_f1(item):
     (d / "r1").mkdir()
     (d / "r2").mkdir()
     ex1 = execute([(p1, d / "r1", cwd, 1.0, d / "profile", "stream")], arm, mode, 300, arm == "ego")
-    fin1 = finish_run(arm, cwd, ex1)
+    fin1 = finish_run(arm, cwd, ex1, force_close=True)
     m1 = parse_stream(d / "r1/stream.jsonl", cwd)
     # Browser restart between sessions.
     if arm == "ego":
@@ -901,6 +927,8 @@ LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 
 def preamble_v2(arm, f4=False):
+    if os.environ.get("BENCH_DEMO_SESSION"):
+        return preamble(arm, f4)
     return preamble(arm, f4) + PREAMBLE_V2_EXTRA
 
 
@@ -1174,7 +1202,7 @@ def run_f1v2(item):
     (d / "r1").mkdir()
     (d / "r2").mkdir()
     ex1 = execute([(p1, d / "r1", cwd, 1.0, d / "profile", "stream")], arm, mode, 300, arm == "ego")
-    fin1 = finish_run(arm, cwd, ex1)
+    fin1 = finish_run(arm, cwd, ex1, force_close=True)
     m1 = parse_stream(d / "r1/stream.jsonl", cwd)
     if arm == "ego":
         ego_restart()
@@ -1402,6 +1430,8 @@ def run_item(item, fx):
     clean = lambda e: {k: v for k, v in e.items() if k not in ("baseline", "claude_pids")}
     meta = {
         "item": item, "arm_label": ARMS[item["arm"]]["label"], "started": started, "finished": now(),
+        "execution_policy": "persistent-demo" if os.environ.get("BENCH_DEMO_SESSION") else "fresh",
+        "demo_session": os.environ.get("BENCH_DEMO_SESSION"),
         "judge": judge, "exec": [clean(e) for e in exs], "finish": fins, "metrics": ms,
         "cost_usd": round(sum(m["cost_usd"] for m in ms), 4),
         "tokens_total": sum(m["tokens"]["total"] for m in ms),
@@ -1609,6 +1639,7 @@ def run_cli_demo(args):
             except OSError:
                 raise SystemExit(f"Port {port} is already in use. Stop your previous benchmark server first.")
     env = {**os.environ, "BENCH_BUDGET_USD": str(args.budget_usd), "PLAYWRIGHT_HTML_OPEN": "never"}
+    env.pop("BENCH_DEMO_SESSION", None)
     RESULTS.mkdir(exist_ok=True)
     def command(*parts):
         return [sys.executable, str(ROOT / "bench.py"), *parts]
@@ -1621,6 +1652,8 @@ def run_cli_demo(args):
     # Generate the shared instruction file once, before parallel readers start.
     arm_skill_file("pwcli")
     jobs = []
+    lanes = []
+    lane_suffix = secrets.token_hex(3)
     server = None
     exit_code = 0
     def stop(process):
@@ -1655,9 +1688,22 @@ def run_cli_demo(args):
                     raise RuntimeError(f"Benchmark server did not become ready; see {log_path}")
                 time.sleep(0.1)
             print(f"CLI demo: v1 34 + v2 45 items; {'parallel' if args.parallel else 'sequential'}; budget gate ${args.budget_usd:g}", flush=True)
-            for schedule in ("schedule.json", "schedule-v2.json"):
+            if not args.fresh_sessions:
+                print("Presentation mode keeps one browser per suite; timing, memory, stability and headed labels are not comparable to fresh-session measurements.", flush=True)
+            for suite, schedule in (("v1", "schedule.json"), ("v2", "schedule-v2.json")):
+                child_env = dict(env)
+                if not args.fresh_sessions:
+                    lane = f"{suite}-demo-{lane_suffix}"
+                    child_env["BENCH_DEMO_SESSION"] = lane
+                    output = WORK / "demo-output" / lane
+                    output.mkdir(parents=True, exist_ok=True)
+                    browser_env = {**child_env, "PLAYWRIGHT_MCP_OUTPUT_DIR": str(output)}
+                    lanes.append(lane)
+                    subprocess.run(["playwright-cli", f"-s={lane}", "open", f"http://127.0.0.1:{WG_PORT}/"],
+                                   cwd=output, env=browser_env, check=True)
+                    print(f"{suite} dashboard session: {lane} (kept between tasks; F1 restarts, F2 adds two helpers)", flush=True)
                 job = subprocess.Popen(command("run", "--arms", "pwcli", "--schedule", schedule),
-                                       cwd=ROOT, env=env, start_new_session=True)
+                                       cwd=ROOT, env=child_env, start_new_session=True)
                 jobs.append(job)
                 if not args.parallel:
                     code = job.wait()
@@ -1690,6 +1736,13 @@ def run_cli_demo(args):
     finally:
         for job in jobs:
             stop(job)
+        for lane in lanes:
+            for name in (lane, lane + "-user-b", lane + "-user-c"):
+                try:
+                    subprocess.run(["playwright-cli", f"-s={name}", "close"], cwd=ROOT, env=env,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+                except (OSError, subprocess.TimeoutExpired):
+                    print(f"Could not close owned demo session {name}; check it manually.", flush=True)
         if server is not None:
             stop(server)
 
@@ -1715,6 +1768,7 @@ def main():
     sub.add_parser("schedule-v2")
     demo = sub.add_parser("demo", help="run the complete CLI v1/v2 demo using the existing commands")
     demo.add_argument("--parallel", action="store_true", help="run v1 and v2 concurrently (demo timings differ from sequential measurements)")
+    demo.add_argument("--fresh-sessions", action="store_true", help="use the original fresh-browser policy instead of keeping one demo session per suite")
     demo.add_argument("--budget-usd", type=float, default=15.0, help="cumulative cost gate (not a hard billing cap), default 15")
     a = ap.parse_args()
     if a.cmd == "demo":
