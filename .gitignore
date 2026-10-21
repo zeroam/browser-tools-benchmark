@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.cache/
+__pycache__/
+*.pyc
+.admin-token
+.demo-token
+.demo/
+results/
+runs/
+test-results/
+playwright-report/
+.playwright-cli/
+.browser-output/
+.env*
+*.log
+.DS_Store

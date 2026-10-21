@@ -1,0 +1,11 @@
+Browser tools benchmark
+
+Includes the WebGames source snapshot used in the October 2026 experiments.
+Upstream: https://github.com/convergence-ai/webgames
+WebGames is distributed under Apache License 2.0; see webgames/LICENSE.
+The snapshot includes the experiment's task adaptations. It is not claimed to
+be an unmodified checkout of the recorded upstream reference 309866f.
+
+The harness was adapted for sharing: relative installation paths, scoped
+sessions, foreground server lifecycle, no global skill mutation, and a
+deterministic demonstration of passing normal apps and rejecting mutations.
