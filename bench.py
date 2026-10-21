@@ -1563,6 +1563,7 @@ def cmd_serve(_):
     # Foreground supervisor: refuse occupied ports and stop only these child processes.
     for port in (FIX_PORT, WG_PORT):
         with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             probe.bind(("127.0.0.1", port))
     if not (ROOT / "webgames/dist/index.html").exists():
         raise SystemExit("Run sh bin/build-webgames.sh first")
@@ -1634,6 +1635,7 @@ def run_cli_demo(args):
     # Refuse existing servers; never reuse or shut down a different checkout.
     for port in (FIX_PORT, WG_PORT):
         with socket.socket() as probe:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
                 probe.bind(("127.0.0.1", port))
             except OSError:
@@ -1659,9 +1661,36 @@ def run_cli_demo(args):
     def stop(process):
         if process.poll() is None:
             try:
-                os.killpg(process.pid, signal.SIGTERM)
+                # Agent calls intentionally create their own process groups.
+                # Freeze the runner before discovering its descendants, so it
+                # cannot launch the next paid call while cancellation proceeds.
+                os.kill(process.pid, signal.SIGSTOP)
             except ProcessLookupError:
-                pass
+                process.wait()
+                return
+            try:
+                processes = ps()
+                descendants = {process.pid}
+                while True:
+                    added = {pid for pid, (parent, _, _) in processes.items()
+                             if parent in descendants} - descendants
+                    if not added:
+                        break
+                    descendants |= added
+                for pid in descendants - {process.pid}:
+                    try:
+                        if os.getpgid(pid) == pid:
+                            os.killpg(pid, signal.SIGTERM)
+                        else:
+                            os.kill(pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                    os.kill(process.pid, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:

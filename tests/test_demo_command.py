@@ -12,7 +12,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bench
 
-STUB = '''import json,os,socket,sys,time
+STUB = '''import json,os,socket,subprocess,sys,time
 from pathlib import Path
 root=Path(__file__).resolve().parent
 def event(name):
@@ -22,13 +22,17 @@ args=sys.argv[1:]
 if args[0]=='serve':
     sockets=[]
     for key in ['DEMO_TEST_PORT1','DEMO_TEST_PORT2']:
-        s=socket.socket();s.bind(('127.0.0.1',int(os.environ[key])));s.listen();sockets.append(s)
+        s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1',int(os.environ[key])));s.listen();sockets.append(s)
     (root/'server.pid').write_text(str(os.getpid()))
     print('Fixture and WebGames ready',flush=True)
     while True:time.sleep(1)
 elif args[0]=='run':
     suite='v2' if 'schedule-v2.json' in args else 'v1'
     event('start-'+suite)
+    if suite=='v2' and os.environ.get('DEMO_TEST_ISOLATED_AGENT'):
+        agent=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],start_new_session=True)
+        (root/'agent.pid').write_text(str(agent.pid))
+        time.sleep(60)
     time.sleep(0.25)
     event('end-'+suite)
     if suite=='v1' and os.environ.get('DEMO_TEST_BUDGET_STOP'):sys.exit(2)
@@ -37,7 +41,8 @@ else:event(args[0])
 
 
 class DemoCommandTest(unittest.TestCase):
-    def execute_demo(self, parallel, budget_stop=False, fresh_sessions=False):
+    def execute_demo(self, parallel, budget_stop=False, fresh_sessions=False, recently_used_port=False,
+                     isolated_agent=False):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / 'bench.py').write_text(STUB)
@@ -53,14 +58,23 @@ class DemoCommandTest(unittest.TestCase):
             cli.chmod(0o755)
             held = [socket.socket(), socket.socket()]
             for s in held:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind(('127.0.0.1', 0))
             ports = [s.getsockname()[1] for s in held]
+            if recently_used_port:
+                held[0].listen()
+                client = socket.create_connection(('127.0.0.1', ports[0]))
+                accepted, _ = held[0].accept()
+                accepted.close()
+                client.close()
             for s in held:
                 s.close()
             env = {'DEMO_TEST_PORT1': str(ports[0]), 'DEMO_TEST_PORT2': str(ports[1]),
                    'PATH': str(bindir) + os.pathsep + os.environ.get('PATH', '')}
             if budget_stop:
                 env['DEMO_TEST_BUDGET_STOP'] = '1'
+            if isolated_agent:
+                env['DEMO_TEST_ISOLATED_AGENT'] = '1'
             with patch.object(bench, 'ROOT', root), patch.object(bench, 'RESULTS', root / 'results'), \
                  patch.object(bench, 'WORK', root / 'work'), \
                  patch.object(bench, 'FIX_PORT', ports[0]), patch.object(bench, 'WG_PORT', ports[1]), \
@@ -70,6 +84,26 @@ class DemoCommandTest(unittest.TestCase):
             pid = int((root / 'server.pid').read_text())
             with self.assertRaises(ProcessLookupError):
                 os.kill(pid, 0)
+            if isolated_agent:
+                agent_pid = int((root / 'agent.pid').read_text())
+                try:
+                    import subprocess
+                    import time
+                    deadline = time.monotonic() + 2
+                    while True:
+                        status = subprocess.run(['ps', '-p', str(agent_pid), '-o', 'stat='],
+                                                capture_output=True, text=True)
+                        running = status.returncode == 0 and 'Z' not in status.stdout
+                        if not running or time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.05)
+                    self.assertFalse(running, 'Demo cancellation left an isolated agent running')
+                finally:
+                    try:
+                        import signal
+                        os.kill(agent_pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
             events = [json.loads(line) for line in (root / 'events.jsonl').read_text().splitlines()]
             return code, events
 
@@ -91,6 +125,10 @@ class DemoCommandTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertTrue(all(x['session'] is None for x in events))
 
+    def test_recently_closed_connection_does_not_block_restart(self):
+        code, _ = self.execute_demo(parallel=True, recently_used_port=True)
+        self.assertEqual(code, 0)
+
     def test_sequential_budget_stop_does_not_start_v2(self):
         code, events = self.execute_demo(parallel=False, budget_stop=True)
         self.assertEqual(code, 2)
@@ -98,6 +136,10 @@ class DemoCommandTest(unittest.TestCase):
 
     def test_parallel_budget_stop_preserves_budget_exit_code(self):
         code, _ = self.execute_demo(parallel=True, budget_stop=True)
+        self.assertEqual(code, 2)
+
+    def test_budget_stop_also_stops_agents_in_a_separate_process_group(self):
+        code, _ = self.execute_demo(parallel=True, budget_stop=True, isolated_agent=True)
         self.assertEqual(code, 2)
 
     def test_busy_port_is_rejected_without_touching_its_listener(self):
