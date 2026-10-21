@@ -5,6 +5,7 @@ Same model, same prompt, only the browser tool changes. See the Work Brief
 "에이전트 브라우저 작업을 Playwright CLI로 옮기고 콘솔 로그인 상태를 유지한다" (Q6).
 
 Subcommands:
+  demo --parallel  run CLI v1 and v2 together, including servers and reports
   serve            start fixture + WebGames servers in the background
   versions         record tool/browser/model versions to results/versions.json
   schedule         write the fixed run schedule to results/schedule.json
@@ -12,6 +13,7 @@ Subcommands:
   one ID           execute a single scheduled run (pilot)
 """
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -1510,10 +1512,12 @@ def cmd_run(args):
             return 2
         log.write(f"{time.ctime()} START {item['id']}\n")
         log.flush()
+        print(f"START {item['id']} ({done + skipped + 1}/{len(sched)})", flush=True)
         try:
             meta = run_item(item, fx)
             log.write(f"{time.ctime()} END {item['id']} success={meta['judge']['success']} "
                       f"cost={meta['cost_usd']} tokens={meta['tokens_total']} wall={meta['wall_s']}\n")
+            print(f"END {item['id']} success={meta['judge']['success']} cost=${meta['cost_usd']:.4f}", flush=True)
         except Exception as e:  # keep going; the run is recorded as missing and can be retried
             errors += 1
             import traceback
@@ -1580,6 +1584,116 @@ def cmd_versions(_):
     print(json.dumps(v, indent=1))
 
 
+def cmd_demo(args):
+    """Compose the existing commands into a resumable CLI v1/v2 demonstration."""
+    import math
+    if not math.isfinite(args.budget_usd) or args.budget_usd <= 0:
+        raise SystemExit("--budget-usd must be a positive finite number")
+    with (ROOT / ".demo-run.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("A demo is already running in this checkout")
+        return run_cli_demo(args)
+
+
+def run_cli_demo(args):
+    for executable in ("claude", "playwright-cli", "node", "npm"):
+        if not shutil.which(executable):
+            raise SystemExit(f"Missing {executable}; see README installation instructions")
+    # Refuse existing servers; never reuse or shut down a different checkout.
+    for port in (FIX_PORT, WG_PORT):
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                raise SystemExit(f"Port {port} is already in use. Stop your previous benchmark server first.")
+    env = {**os.environ, "BENCH_BUDGET_USD": str(args.budget_usd), "PLAYWRIGHT_HTML_OPEN": "never"}
+    RESULTS.mkdir(exist_ok=True)
+    def command(*parts):
+        return [sys.executable, str(ROOT / "bench.py"), *parts]
+    if not (ROOT / "tools/node_modules/@playwright/test").is_dir():
+        subprocess.run(["npm", "ci", "--prefix", "tools"], cwd=ROOT, env=env, check=True)
+    if not (ROOT / "webgames/dist/index.html").is_file():
+        subprocess.run(["sh", "bin/build-webgames.sh"], cwd=ROOT, env=env, check=True)
+    for step in ("versions", "schedule", "schedule-v2"):
+        subprocess.run(command(step), cwd=ROOT, env=env, check=True)
+    # Generate the shared instruction file once, before parallel readers start.
+    arm_skill_file("pwcli")
+    jobs = []
+    server = None
+    exit_code = 0
+    def stop(process):
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+    log_path = RESULTS / "demo-server.log"
+    try:
+        with log_path.open("w") as log:
+            server = subprocess.Popen(command("serve"), cwd=ROOT, env=env, stdout=log,
+                                      stderr=subprocess.STDOUT, start_new_session=True)
+            deadline = time.monotonic() + 15
+            while True:
+                if server.poll() is not None:
+                    raise RuntimeError(f"Benchmark server exited; see {log_path}")
+                if "Fixture" in log_path.read_text():
+                    try:
+                        for port in (FIX_PORT, WG_PORT):
+                            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                                pass
+                        break
+                    except OSError:
+                        pass
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Benchmark server did not become ready; see {log_path}")
+                time.sleep(0.1)
+            print(f"CLI demo: v1 34 + v2 45 items; {'parallel' if args.parallel else 'sequential'}; budget gate ${args.budget_usd:g}", flush=True)
+            for schedule in ("schedule.json", "schedule-v2.json"):
+                job = subprocess.Popen(command("run", "--arms", "pwcli", "--schedule", schedule),
+                                       cwd=ROOT, env=env, start_new_session=True)
+                jobs.append(job)
+                if not args.parallel:
+                    code = job.wait()
+                    exit_code = max(exit_code, code)
+                    if code == 2:
+                        break
+            while any(job.poll() is None for job in jobs):
+                if any(job.poll() == 2 for job in jobs):
+                    exit_code = 2
+                    break
+                if server.poll() is not None:
+                    raise RuntimeError(f"Benchmark server exited; see {log_path}")
+                time.sleep(0.2)
+            if any(job.poll() == 2 for job in jobs):
+                exit_code = 2
+            for job in jobs:
+                if job.poll() is None:
+                    stop(job)
+                if job.returncode != 0 and exit_code != 2:
+                    exit_code = 1
+            for score in ("score.py", "score_v2.py"):
+                result = subprocess.run([sys.executable, str(ROOT / score)], cwd=ROOT, env=env)
+                if result.returncode and exit_code == 0:
+                    exit_code = 1
+            print("Reports: results/report.md and results/report-v2.md. CLI-only run: tool choice remains undecided.", flush=True)
+            return exit_code
+    except KeyboardInterrupt:
+        print("Stopping this demo's processes.", flush=True)
+        return 130
+    finally:
+        for job in jobs:
+            stop(job)
+        if server is not None:
+            stop(server)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1599,7 +1713,12 @@ def main():
     o.add_argument("--force", action="store_true")
     o.add_argument("--schedule")
     sub.add_parser("schedule-v2")
+    demo = sub.add_parser("demo", help="run the complete CLI v1/v2 demo using the existing commands")
+    demo.add_argument("--parallel", action="store_true", help="run v1 and v2 concurrently (demo timings differ from sequential measurements)")
+    demo.add_argument("--budget-usd", type=float, default=15.0, help="cumulative cost gate (not a hard billing cap), default 15")
     a = ap.parse_args()
+    if a.cmd == "demo":
+        return cmd_demo(a)
     if a.cmd == "serve":
         return cmd_serve(a)
     if a.cmd == "versions":
